@@ -6,11 +6,13 @@
 #include <unistd.h>
 #include <math.h>
 #include <pthread.h>
+#include <time.h>
 
 #define MAX_FNAME	64
 #define FILEHEADER	14
 #define INFOHEADER	40
 
+int width = 0, height = 0, nThreads = 0, part = 0;
 char fName[MAX_FNAME] = "screen.bmp";
 char *outName = "copy.bmp";
 int sobelMatrix[3][3] = {
@@ -22,8 +24,7 @@ int sobelMatrix[3][3] = {
 typedef struct {
 	int *sobelArr;
 	int *pixArr;
-	int y;
-	int width;
+	int i;
 } Args;
 
 //turning image to blackwhite colors
@@ -33,7 +34,7 @@ int turnToGrey(int x) {
 }
 
 //gradient for Y
-int sumY(int* arr, int x, int y, int width) {
+int sumY(int* arr, int x, int y) {
 	int res = 0;
 	res += (arr[(y - 1) * width + x - 1] & 255) * sobelMatrix[0][0];
 	res += (arr[(y - 1) * width + x    ] & 255) * sobelMatrix[0][1];
@@ -45,7 +46,7 @@ int sumY(int* arr, int x, int y, int width) {
 }
 
 //gradient for X
-int sumX(int* arr, int x, int y, int width) {
+int sumX(int* arr, int x, int y) {
 	int res = 0;
 	res += (arr[(y - 1) * width + x - 1] & 255) * sobelMatrix[2][0];
 	res += (arr[(y    ) * width + x - 1] & 255) * sobelMatrix[2][1];
@@ -58,39 +59,45 @@ int sumX(int* arr, int x, int y, int width) {
 
 //work for threads
 void *work(void *input) {
+	//reading variables from struct
 	Args data = *(Args*)input;
 	int *sobelArr = data.sobelArr;
 	int *pixArr = data.pixArr;
-	int y = data.y;
-	int width = data.width;
+	int i = data.i;
+	int max = (i == nThreads - 1) ? height - 1 : part * (i+1) + 1;
 
-	for(int x = 1; x < width - 1; x++) {
-		int tmp = 0;
-		int tmpX = sumX(pixArr, x, y, width);
-		int tmpY = sumY(pixArr, x, y, width);
-		tmp = (int)sqrt((tmpX * tmpX + tmpY * tmpY));
-		tmp = (tmp > 0) ? (tmp > 255) ? 255 : tmp : 0;
-		sobelArr[y * width + x] = (tmp << 16) | (tmp << 8) | tmp;
+	for(int y = part * i + 1; y < max; y++) {
+		for(int x = 1; x < width - 1; x++) {
+			int tmp = 0;
+			int tmpX = sumX(pixArr, x, y);
+			int tmpY = sumY(pixArr, x, y);
+			tmp = (int)sqrt((tmpX * tmpX + tmpY * tmpY));
+			tmp = (tmp > 0) ? (tmp > 255) ? 255 : tmp : 0;
+			sobelArr[y * width + x] = (tmp << 16) | (tmp << 8) | tmp;
+		}
 	}
 	return NULL;
 }
 
 int main() {
-	int rfd, wfd;	//file descriptord for read and write respectievly
+	int rfd, wfd;		//file descriptord for read and write respectievly
 	char fileHeader[FILEHEADER];	//14 bytes for header
 	char infoHeader[INFOHEADER];	//40 bytes for info
-	int fileSize = 0;			//image file size
-	int width = 0, height = 0;	//width and height of image
-	int padding = 0;			//padding at the end of each row
-	int tmp = 0;		//temporary var
+	int fileSize = 0;	//image file size
+	int padding = 0;	//padding at the end of each row
+	int bufLen = 0;		//length of buffer
 	int *pixArr;		//array of pixels of original image
 	int *sobelArr;		//array of processed original pixels
-	char buf[16000];	//buffer for reading whole row of image
-	pthread_t *th;
-	Args *data;
+	char *buf;			//buffer for reading whole row of image
+	struct timespec start, end;	//time variables
+	double elapsed;		//elapsed time after threads start
+	pthread_t *th;		//threads
+	Args *data;			//arguments for threads work
 
-	printf("Enter filename: ");
+//	printf("Enter filename: ");
 //	scanf("%s", fName);
+	printf("Enter number of threads: ");
+	scanf("%d", &nThreads);
 
 	//open image
 	if((rfd = open(fName, O_RDONLY)) < 0) return 1;
@@ -107,78 +114,84 @@ int main() {
 	}
 	printf("File size: %d\nWidth: %d\nHeight: %d\n", fileSize, width, height);
 
+	if(nThreads < 1 || nThreads > height - 2) {
+		perror("Invalid number. It must be between 1 and image HEIGHT - 2\n");
+		return 1;
+	}
+
 	//allocating memory for pixels
 	pixArr = (int*)malloc(width * height * sizeof(int));
 	sobelArr = (int*)malloc(width * height * sizeof(int));
-	th = (pthread_t*)malloc((height - 2) * sizeof(pthread_t));
-	data = (Args*)malloc((height - 2) * sizeof(Args));
+	th = (pthread_t*)malloc((nThreads) * sizeof(pthread_t));
+	data = (Args*)malloc((nThreads) * sizeof(Args));
 	padding = ((4 - (width * 3) % 4) % 4);
-
-	for(int y = 0; y < height; y++) {
-		read(rfd, buf, width * 3);	//read row
-		for(int x = 0; x < width; x++) {
-			pixArr[y * width + x] = (	//save row
-					((buf[3*x] << 16) & 0xff0000) | 
-					((buf[3*x+1] << 8) & 0xff00) | 
-					((buf[3*x+2] ) & 0xff)
-					);
-			pixArr[y * width + x] = turnToGrey(pixArr[y * width + x]);
-		}
-		read(rfd, &tmp, padding);	//read padding
-	}
-	close(rfd);
+	bufLen = width * height * 3 + padding * height;
+	buf = (char*)malloc(bufLen);
 	
-	//opening file to write processed image
-	if((wfd = open(outName, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) return 4;
+	//reading image
+	read(rfd, buf, bufLen);
+	close(rfd);
 
-	//write metadata
-	write(wfd, fileHeader, FILEHEADER);
-	write(wfd, infoHeader, INFOHEADER);
+	//transforming chars into integers
+	for(int y = 0; y < height; y++) {
+		for(int x = 0; x < width; x++) {
+			int i = (	//save row
+				((buf[y*width*3+3*x] << 16) & 0xff0000) | 
+				((buf[y*width*3+3*x+1] << 8) & 0xff00) | 
+				((buf[y*width*3+3*x+2] ) & 0xff)
+				);
+			pixArr[y * width + x] = (((i >> 16) & 255)+((i >> 8) & 255)+(i & 255)) / 3;
+		}
+	}
+	
+	printf("Start timer\n");
+	clock_gettime(CLOCK_MONOTONIC, &start);
 
-	//distribute work for "height-1" threads
-	for(int y = 1; y < height - 1; y++) {
-		data[y-1].sobelArr = sobelArr;
-		data[y-1].pixArr = pixArr;
-		data[y-1].y = y;
-		data[y-1].width = width;
-		if(pthread_create(&th[y-1], NULL, &work, (void*)&data[y-1]) != 0)
+	//calculating count of rows for one thread
+	part = (int)((float)(height - 2) / nThreads);
+
+	//distribute work for "nThreads" threads
+	for(int i = 0; i < nThreads; i++) {
+		data[i].sobelArr = sobelArr;
+		data[i].pixArr = pixArr;
+		data[i].i = i;
+		if(pthread_create(th + i, NULL, &work, (void*)(data + i)) != 0)
 			return 5;
 	}
 
 	//wait while threads complete work
-	for(int y = 1; y < height - 1; y++)
-		if(pthread_join(th[y-1], NULL) != 0)
+	for(int i = 0; i < nThreads; i++)
+		if(pthread_join(th[i], NULL) != 0)
 			return 6;
 
-	//writing first row
-	for(int x = 0; x < width; x++)
-		buf[x] = 0;
-	write(wfd, buf, width * 3);
-	write(wfd, &tmp, padding);
+	clock_gettime(CLOCK_MONOTONIC, &end);
+	//calculating and printing work time
+	printf("End timer\n");
+	elapsed = end.tv_sec - start.tv_sec;
+	elapsed += (end.tv_nsec - start.tv_nsec) / 1000000000.0;
+	printf("Time elapsed: %.5lfs\n", elapsed);
 
-	//writing processed pixels
+	//translating bytes from integers to chars
 	for(int y = 1; y < height - 1; y++) {
-		write(wfd, &tmp, 3);	//write first pixel in row
 		for(int x = 1; x < width - 1; x++) {
-			buf[(x-1)*3] = (sobelArr[y * width + x] >> 16) & 255;
-			buf[(x-1)*3+1] = (sobelArr[y * width + x] >> 8) & 255;
-			buf[(x-1)*3+2] = (sobelArr[y * width + x] ) & 255;
+			buf[y*width*3+x*3] = (sobelArr[y * width + x] >> 16) & 255;
+			buf[y*width*3+x*3+1] = (sobelArr[y * width + x] >> 8) & 255;
+			buf[y*width*3+x*3+2] = (sobelArr[y * width + x] ) & 255;
 		}
-		write(wfd, buf, (width - 2) * 3);	//writing processed row
-		write(wfd, &tmp, 3);				//writing last pixel in row
-		write(wfd, &tmp, padding);			//writing padding
 	}
 
-	//writing last row of image
-	for(int x = 0; x < width; x++)
-		buf[x] = 0;
-
-	write(wfd, buf, width * 3);
-	write(wfd, &tmp, padding);
-
+	//opening file to write processed image
+	if((wfd = open(outName, O_WRONLY | O_CREAT | O_TRUNC, 0666)) < 0) return 4;
+	//write metadata
+	write(wfd, fileHeader, FILEHEADER);
+	write(wfd, infoHeader, INFOHEADER);
+	//writing processed pixels
+	write(wfd, buf, bufLen);
 	close(wfd);
 
+	//free reserved memory
 	free(th);
+	free(buf);
 	free(data);
 	free(pixArr);
 	free(sobelArr);
